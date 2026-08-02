@@ -33,7 +33,6 @@ class CameraModeActivity : AppCompatActivity() {
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private var analysisBusy = false
 
-    // Filtro anti-rumore: teniamo l'ultimo valore buono invece di seguire ogni lettura singola
     private var lastGoodSpeed: Double? = null
     private var pendingCandidate: Double? = null
     private var pendingCount = 0
@@ -125,7 +124,6 @@ class CameraModeActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** Converte il fotogramma YUV della fotocamera in un Bitmap normale, già ruotato correttamente. */
     private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
         val yBuffer = imageProxy.planes[0].buffer
         val uBuffer = imageProxy.planes[1].buffer
@@ -179,9 +177,8 @@ class CameraModeActivity : AppCompatActivity() {
             val image = InputImage.fromBitmap(bitmapToAnalyze, 0)
             recognizer.process(image)
                 .addOnSuccessListener { visionText ->
-                    val cleanedText = visionText.text.replace(Regex("""\s+"""), "")
-                    val match = Regex("""\d+[.,]?\d*""").find(cleanedText)
-                    val raw = match?.value?.replace(',', '.')?.toDoubleOrNull()
+                    val digitsOnly = visionText.text.filter { it.isDigit() }
+                    val raw = parseThreeDigitSpeed(digitsOnly)
                     handleDetectedValue(raw)
                 }
                 .addOnCompleteListener {
@@ -194,25 +191,28 @@ class CameraModeActivity : AppCompatActivity() {
         }
     }
 
+    private fun parseThreeDigitSpeed(digits: String): Double? {
+        if (digits.isEmpty()) return null
+        if (digits.length < 3) return 10.0
+        val first3 = digits.take(3)
+        if (first3 == "000") return 0.0
+        val intPart = first3.substring(0, 2).toIntOrNull() ?: return 10.0
+        val decDigit = first3.substring(2, 3).toIntOrNull() ?: 0
+        return intPart + decDigit / 10.0
+    }
+
     private fun handleDetectedValue(raw: Double?) {
-        if (raw == null) return // nessuna cifra letta in questo fotogramma: teniamo l'ultimo valore buono
+        if (raw == null) return
 
         var candidate = raw
-        // Euristica: se il punto decimale non è stato letto (es. "20.0" letto come "200")
-        // e il valore risulta irrealisticamente alto, proviamo a dividerlo per 10.
-        if (candidate > 60.0 && candidate % 10.0 == 0.0) {
-            val adjusted = candidate / 10.0
-            if (adjusted in 0.0..60.0) candidate = adjusted
+        if (candidate != 0.0) {
+            candidate = candidate.coerceIn(10.0, 40.0)
         }
-        if (candidate !in 0.0..80.0) return // fuori range plausibile per una cyclette, scartiamo
 
         val last = lastGoodSpeed
         if (last == null || abs(candidate - last) <= 5.0) {
-            // prima lettura, o variazione piccola: accettiamo subito
             acceptSpeed(candidate)
         } else {
-            // salto grande e improvviso: chiediamo conferma su un secondo fotogramma simile
-            // prima di accettarlo, per non seguire un singolo errore di lettura
             if (pendingCandidate != null && abs(candidate - pendingCandidate!!) <= 2.0) {
                 pendingCount++
             } else {
@@ -238,4 +238,3 @@ class CameraModeActivity : AppCompatActivity() {
         peripheral.stop()
     }
 }
-
