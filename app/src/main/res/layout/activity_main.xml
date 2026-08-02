@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:padding="32dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="CLEO → MYWHOOSH"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="48dp" />
+
+    <Button
+        android:id="@+id/buttonTestMode"
+        android:layout_width="260dp"
+        android:layout_height="64dp"
+        android:text="MODALITÀ TEST&#10;(velocità manuale)"
+        android:layout_marginBottom="24dp" />
+
+    <Button
+        android:id="@+id/buttonCameraMode"
+        android:layout_width="260dp"
+        android:layout_height="64dp"
+        android:text="MODALITÀ FOTOCAMERA&#10;(lettura OCR)"
+        android:layout_marginBottom="24dp" />
+
+    <Button
+        android:id="@+id/buttonUsbCameraMode"
+        android:layout_width="260dp"
+        android:layout_height="64dp"
+        android:text="MODALITÀ WEBCAM USB&#10;(lettura OCR)" />
+
+</LinearLayout>

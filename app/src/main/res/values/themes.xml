@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.CleoBLE" parent="Theme.MaterialComponents.DayNight.NoActionBar" />
+</resources>
