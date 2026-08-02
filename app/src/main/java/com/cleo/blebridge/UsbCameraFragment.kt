@@ -25,11 +25,6 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import kotlin.math.abs
 
-/**
- * Legge una webcam USB (UVC) usando la libreria UVCAndroid (com.herohan),
- * la stessa base tecnologica dell'app "USB Camera" che già funziona su questo tablet.
- * Riusa lo stesso motore OCR + filtro anti-rumore + BLE delle altre modalità.
- */
 class UsbCameraFragment : Fragment() {
 
     private var mViewBinding: FragmentUsbCameraBinding? = null
@@ -205,8 +200,6 @@ class UsbCameraFragment : Fragment() {
         }
         logLine("In ascolto per eventi di attacco/distacco USB live")
 
-        // Se un dispositivo è già collegato da prima che aprissimo questa schermata,
-        // avviamo comunque la richiesta di permesso subito.
         val usbManager = requireContext().getSystemService(android.content.Context.USB_SERVICE) as android.hardware.usb.UsbManager
         val alreadyConnected = usbManager.deviceList.values.firstOrNull()
         if (alreadyConnected != null) {
@@ -291,9 +284,8 @@ class UsbCameraFragment : Fragment() {
             val image = InputImage.fromBitmap(bitmapToAnalyze, 0)
             recognizer.process(image)
                 .addOnSuccessListener { visionText ->
-                    val cleanedText = visionText.text.replace(Regex("""\s+"""), "")
-                    val match = Regex("""\d+[.,]?\d*""").find(cleanedText)
-                    val rawValue = match?.value?.replace(',', '.')?.toDoubleOrNull()
+                    val digitsOnly = visionText.text.filter { it.isDigit() }
+                    val rawValue = parseThreeDigitSpeed(digitsOnly)
                     handleDetectedValue(rawValue)
                 }
                 .addOnCompleteListener { analysisBusy = false }
@@ -315,15 +307,23 @@ class UsbCameraFragment : Fragment() {
         }
     }
 
+    private fun parseThreeDigitSpeed(digits: String): Double? {
+        if (digits.isEmpty()) return null
+        if (digits.length < 3) return 10.0
+        val first3 = digits.take(3)
+        if (first3 == "000") return 0.0
+        val intPart = first3.substring(0, 2).toIntOrNull() ?: return 10.0
+        val decDigit = first3.substring(2, 3).toIntOrNull() ?: 0
+        return intPart + decDigit / 10.0
+    }
+
     private fun handleDetectedValue(raw: Double?) {
         if (raw == null) return
 
         var candidate = raw
-        if (candidate > 60.0 && candidate % 10.0 == 0.0) {
-            val adjusted = candidate / 10.0
-            if (adjusted in 0.0..60.0) candidate = adjusted
+        if (candidate != 0.0) {
+            candidate = candidate.coerceIn(10.0, 40.0)
         }
-        if (candidate !in 0.0..80.0) return
 
         val last = lastGoodSpeed
         if (last == null || abs(candidate - last) <= 5.0) {
