@@ -33,7 +33,6 @@ class CameraModeActivity : AppCompatActivity() {
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private var analysisBusy = false
 
-    // Filtro anti-rumore: teniamo l'ultimo valore buono invece di seguire ogni lettura singola
     private var lastGoodSpeed: Double? = null
     private var pendingCandidate: Double? = null
     private var pendingCount = 0
@@ -125,7 +124,6 @@ class CameraModeActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** Converte il fotogramma YUV della fotocamera in un Bitmap normale, già ruotato correttamente. */
     private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
         val yBuffer = imageProxy.planes[0].buffer
         val uBuffer = imageProxy.planes[1].buffer
@@ -176,7 +174,8 @@ class CameraModeActivity : AppCompatActivity() {
                 fullBitmap
             }
 
-            val image = InputImage.fromBitmap(bitmapToAnalyze, 0)
+            val preprocessed = preprocessForOcr(bitmapToAnalyze)
+            val image = InputImage.fromBitmap(preprocessed, 0)
             recognizer.process(image)
                 .addOnSuccessListener { visionText ->
                     val digitsOnly = extractDigitsLeftToRight(visionText)
@@ -193,11 +192,37 @@ class CameraModeActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Ordina i pezzi di testo trovati dall'OCR in base alla loro posizione ORIZZONTALE reale
-     * sullo schermo (da sinistra a destra), invece di fidarsi dell'ordine con cui il motore
-     * OCR li restituisce di default (che a volte non rispetta l'ordine visivo).
-     */
+    private fun preprocessForOcr(source: Bitmap): Bitmap {
+        val scaleFactor = 3
+        val scaled = Bitmap.createScaledBitmap(source, source.width * scaleFactor, source.height * scaleFactor, true)
+        val width = scaled.width
+        val height = scaled.height
+        val pixels = IntArray(width * height)
+        scaled.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        val luminances = IntArray(pixels.size)
+        var sum = 0L
+        for (i in pixels.indices) {
+            val p = pixels[i]
+            val r = (p shr 16) and 0xFF
+            val g = (p shr 8) and 0xFF
+            val b = p and 0xFF
+            val lum = (r + g + b) / 3
+            luminances[i] = lum
+            sum += lum
+        }
+        val mean = (sum / pixels.size).toInt()
+        val threshold = (mean * 0.75).toInt()
+
+        for (i in pixels.indices) {
+            pixels[i] = if (luminances[i] < threshold) android.graphics.Color.BLACK else android.graphics.Color.WHITE
+        }
+
+        val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        result.setPixels(pixels, 0, width, 0, 0, width, height)
+        return result
+    }
+
     private fun extractDigitsLeftToRight(visionText: com.google.mlkit.vision.text.Text): String {
         val pieces = mutableListOf<Pair<Int, String>>()
         for (block in visionText.textBlocks) {
@@ -214,13 +239,6 @@ class CameraModeActivity : AppCompatActivity() {
         return pieces.sortedBy { it.first }.joinToString("") { it.second }
     }
 
-    /**
-     * Il display della Cleo probabilmente NON mostra lo zero iniziale sotto i 10 km/h
-     * (es. "5.4" invece di "05.4"), quindi il numero di cifre lette può essere 1, 2 o 3:
-     * - 3 cifre: decine, unità, decimale (es. "206" = 20.6)
-     * - 2 cifre: unità, decimale (es. "54" = 5.4, "00" = 0.0)
-     * - 1 cifra: probabilmente solo il decimale letto, poco affidabile
-     */
     private fun parseDigitSpeed(digits: String): Double? {
         return when (digits.length) {
             0 -> null
@@ -240,8 +258,8 @@ class CameraModeActivity : AppCompatActivity() {
     }
 
     private fun handleDetectedValue(raw: Double?) {
-        if (raw == null) return // nessuna cifra letta in questo fotogramma: teniamo l'ultimo valore buono
-        if (raw !in 0.0..99.9) return // fuori range plausibile, scartiamo
+        if (raw == null) return
+        if (raw !in 0.0..99.9) return
         acceptSpeed(raw)
     }
 
