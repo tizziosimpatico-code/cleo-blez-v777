@@ -25,11 +25,6 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import kotlin.math.abs
 
-/**
- * Legge una webcam USB (UVC) usando la libreria UVCAndroid (com.herohan),
- * la stessa base tecnologica dell'app "USB Camera" che già funziona su questo tablet.
- * Riusa lo stesso motore OCR + filtro anti-rumore + BLE delle altre modalità.
- */
 class UsbCameraFragment : Fragment() {
 
     private var mViewBinding: FragmentUsbCameraBinding? = null
@@ -286,7 +281,8 @@ class UsbCameraFragment : Fragment() {
                 bitmap
             }
 
-            val image = InputImage.fromBitmap(bitmapToAnalyze, 0)
+            val preprocessed = preprocessForOcr(bitmapToAnalyze)
+            val image = InputImage.fromBitmap(preprocessed, 0)
             recognizer.process(image)
                 .addOnSuccessListener { visionText ->
                     val digitsOnly = extractDigitsLeftToRight(visionText)
@@ -310,6 +306,37 @@ class UsbCameraFragment : Fragment() {
         } catch (e: Exception) {
             null
         }
+    }
+
+    private fun preprocessForOcr(source: Bitmap): Bitmap {
+        val scaleFactor = 3
+        val scaled = Bitmap.createScaledBitmap(source, source.width * scaleFactor, source.height * scaleFactor, true)
+        val width = scaled.width
+        val height = scaled.height
+        val pixels = IntArray(width * height)
+        scaled.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        val luminances = IntArray(pixels.size)
+        var sum = 0L
+        for (i in pixels.indices) {
+            val p = pixels[i]
+            val r = (p shr 16) and 0xFF
+            val g = (p shr 8) and 0xFF
+            val b = p and 0xFF
+            val lum = (r + g + b) / 3
+            luminances[i] = lum
+            sum += lum
+        }
+        val mean = (sum / pixels.size).toInt()
+        val threshold = (mean * 0.75).toInt()
+
+        for (i in pixels.indices) {
+            pixels[i] = if (luminances[i] < threshold) android.graphics.Color.BLACK else android.graphics.Color.WHITE
+        }
+
+        val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        result.setPixels(pixels, 0, width, 0, 0, width, height)
+        return result
     }
 
     private fun extractDigitsLeftToRight(visionText: com.google.mlkit.vision.text.Text): String {
