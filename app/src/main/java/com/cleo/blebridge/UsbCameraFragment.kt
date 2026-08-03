@@ -25,6 +25,11 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import kotlin.math.abs
 
+/**
+ * Legge una webcam USB (UVC) usando la libreria UVCAndroid (com.herohan),
+ * la stessa base tecnologica dell'app "USB Camera" che già funziona su questo tablet.
+ * Riusa lo stesso motore OCR + filtro anti-rumore + BLE delle altre modalità.
+ */
 class UsbCameraFragment : Fragment() {
 
     private var mViewBinding: FragmentUsbCameraBinding? = null
@@ -284,8 +289,8 @@ class UsbCameraFragment : Fragment() {
             val image = InputImage.fromBitmap(bitmapToAnalyze, 0)
             recognizer.process(image)
                 .addOnSuccessListener { visionText ->
-                    val digitsOnly = visionText.text.filter { it.isDigit() }
-                    val rawValue = parseThreeDigitSpeed(digitsOnly)
+                    val digitsOnly = extractDigitsLeftToRight(visionText)
+                    val rawValue = parseDigitSpeed(digitsOnly)
                     handleDetectedValue(rawValue)
                 }
                 .addOnCompleteListener { analysisBusy = false }
@@ -299,7 +304,7 @@ class UsbCameraFragment : Fragment() {
         return try {
             val yuvImage = YuvImage(data, ImageFormat.NV21, width, height, null)
             val out = ByteArrayOutputStream()
-            yuvImage.compressToJpeg(Rect(0, 0, width, height), 100, out)
+            yuvImage.compressToJpeg(Rect(0, 0, width, height), 85, out)
             val jpegBytes = out.toByteArray()
             android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
         } catch (e: Exception) {
@@ -307,38 +312,44 @@ class UsbCameraFragment : Fragment() {
         }
     }
 
-    private fun parseThreeDigitSpeed(digits: String): Double? {
-        if (digits.isEmpty()) return null
-        if (digits.length < 3) return 10.0
-        val first3 = digits.take(3)
-        if (first3 == "000") return 0.0
-        val intPart = first3.substring(0, 2).toIntOrNull() ?: return 10.0
-        val decDigit = first3.substring(2, 3).toIntOrNull() ?: 0
-        return intPart + decDigit / 10.0
+    private fun extractDigitsLeftToRight(visionText: com.google.mlkit.vision.text.Text): String {
+        val pieces = mutableListOf<Pair<Int, String>>()
+        for (block in visionText.textBlocks) {
+            for (line in block.lines) {
+                for (element in line.elements) {
+                    val box = element.boundingBox ?: continue
+                    val digitsInElement = element.text.filter { it.isDigit() }
+                    if (digitsInElement.isNotEmpty()) {
+                        pieces.add(box.left to digitsInElement)
+                    }
+                }
+            }
+        }
+        return pieces.sortedBy { it.first }.joinToString("") { it.second }
+    }
+
+    private fun parseDigitSpeed(digits: String): Double? {
+        return when (digits.length) {
+            0 -> null
+            1 -> digits.toIntOrNull()?.let { it / 10.0 }
+            2 -> {
+                val intPart = digits.substring(0, 1).toIntOrNull() ?: return null
+                val decDigit = digits.substring(1, 2).toIntOrNull() ?: 0
+                intPart + decDigit / 10.0
+            }
+            else -> {
+                val first3 = digits.take(3)
+                val intPart = first3.substring(0, 2).toIntOrNull() ?: return null
+                val decDigit = first3.substring(2, 3).toIntOrNull() ?: 0
+                intPart + decDigit / 10.0
+            }
+        }
     }
 
     private fun handleDetectedValue(raw: Double?) {
         if (raw == null) return
-
-        var candidate = raw
-        if (candidate != 0.0) {
-            candidate = candidate.coerceIn(10.0, 40.0)
-        }
-
-        val last = lastGoodSpeed
-        if (last == null || abs(candidate - last) <= 5.0) {
-            acceptSpeed(candidate)
-        } else {
-            if (pendingCandidate != null && abs(candidate - pendingCandidate!!) <= 2.0) {
-                pendingCount++
-            } else {
-                pendingCandidate = candidate
-                pendingCount = 1
-            }
-            if (pendingCount >= 2) {
-                acceptSpeed(candidate)
-            }
-        }
+        if (raw !in 0.0..99.9) return
+        acceptSpeed(raw)
     }
 
     private fun acceptSpeed(v: Double) {
