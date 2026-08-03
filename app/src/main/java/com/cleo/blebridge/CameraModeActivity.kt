@@ -33,6 +33,7 @@ class CameraModeActivity : AppCompatActivity() {
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private var analysisBusy = false
 
+    // Filtro anti-rumore: teniamo l'ultimo valore buono invece di seguire ogni lettura singola
     private var lastGoodSpeed: Double? = null
     private var pendingCandidate: Double? = null
     private var pendingCount = 0
@@ -124,6 +125,7 @@ class CameraModeActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    /** Converte il fotogramma YUV della fotocamera in un Bitmap normale, già ruotato correttamente. */
     private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
         val yBuffer = imageProxy.planes[0].buffer
         val uBuffer = imageProxy.planes[1].buffer
@@ -140,7 +142,7 @@ class CameraModeActivity : AppCompatActivity() {
 
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
         val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, imageProxy.width, imageProxy.height), 100, out)
+        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, imageProxy.width, imageProxy.height), 85, out)
         val jpegBytes = out.toByteArray()
         val bitmap = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
 
@@ -177,8 +179,8 @@ class CameraModeActivity : AppCompatActivity() {
             val image = InputImage.fromBitmap(bitmapToAnalyze, 0)
             recognizer.process(image)
                 .addOnSuccessListener { visionText ->
-                    val digitsOnly = visionText.text.filter { it.isDigit() }
-                    val raw = parseThreeDigitSpeed(digitsOnly)
+                    val digitsOnly = extractDigitsLeftToRight(visionText)
+                    val raw = parseDigitSpeed(digitsOnly)
                     handleDetectedValue(raw)
                 }
                 .addOnCompleteListener {
@@ -191,38 +193,56 @@ class CameraModeActivity : AppCompatActivity() {
         }
     }
 
-    private fun parseThreeDigitSpeed(digits: String): Double? {
-        if (digits.isEmpty()) return null
-        if (digits.length < 3) return 10.0
-        val first3 = digits.take(3)
-        if (first3 == "000") return 0.0
-        val intPart = first3.substring(0, 2).toIntOrNull() ?: return 10.0
-        val decDigit = first3.substring(2, 3).toIntOrNull() ?: 0
-        return intPart + decDigit / 10.0
+    /**
+     * Ordina i pezzi di testo trovati dall'OCR in base alla loro posizione ORIZZONTALE reale
+     * sullo schermo (da sinistra a destra), invece di fidarsi dell'ordine con cui il motore
+     * OCR li restituisce di default (che a volte non rispetta l'ordine visivo).
+     */
+    private fun extractDigitsLeftToRight(visionText: com.google.mlkit.vision.text.Text): String {
+        val pieces = mutableListOf<Pair<Int, String>>()
+        for (block in visionText.textBlocks) {
+            for (line in block.lines) {
+                for (element in line.elements) {
+                    val box = element.boundingBox ?: continue
+                    val digitsInElement = element.text.filter { it.isDigit() }
+                    if (digitsInElement.isNotEmpty()) {
+                        pieces.add(box.left to digitsInElement)
+                    }
+                }
+            }
+        }
+        return pieces.sortedBy { it.first }.joinToString("") { it.second }
+    }
+
+    /**
+     * Il display della Cleo probabilmente NON mostra lo zero iniziale sotto i 10 km/h
+     * (es. "5.4" invece di "05.4"), quindi il numero di cifre lette può essere 1, 2 o 3:
+     * - 3 cifre: decine, unità, decimale (es. "206" = 20.6)
+     * - 2 cifre: unità, decimale (es. "54" = 5.4, "00" = 0.0)
+     * - 1 cifra: probabilmente solo il decimale letto, poco affidabile
+     */
+    private fun parseDigitSpeed(digits: String): Double? {
+        return when (digits.length) {
+            0 -> null
+            1 -> digits.toIntOrNull()?.let { it / 10.0 }
+            2 -> {
+                val intPart = digits.substring(0, 1).toIntOrNull() ?: return null
+                val decDigit = digits.substring(1, 2).toIntOrNull() ?: 0
+                intPart + decDigit / 10.0
+            }
+            else -> {
+                val first3 = digits.take(3)
+                val intPart = first3.substring(0, 2).toIntOrNull() ?: return null
+                val decDigit = first3.substring(2, 3).toIntOrNull() ?: 0
+                intPart + decDigit / 10.0
+            }
+        }
     }
 
     private fun handleDetectedValue(raw: Double?) {
-        if (raw == null) return
-
-        var candidate = raw
-        if (candidate != 0.0) {
-            candidate = candidate.coerceIn(10.0, 40.0)
-        }
-
-        val last = lastGoodSpeed
-        if (last == null || abs(candidate - last) <= 5.0) {
-            acceptSpeed(candidate)
-        } else {
-            if (pendingCandidate != null && abs(candidate - pendingCandidate!!) <= 2.0) {
-                pendingCount++
-            } else {
-                pendingCandidate = candidate
-                pendingCount = 1
-            }
-            if (pendingCount >= 2) {
-                acceptSpeed(candidate)
-            }
-        }
+        if (raw == null) return // nessuna cifra letta in questo fotogramma: teniamo l'ultimo valore buono
+        if (raw !in 0.0..99.9) return // fuori range plausibile, scartiamo
+        acceptSpeed(raw)
     }
 
     private fun acceptSpeed(v: Double) {
