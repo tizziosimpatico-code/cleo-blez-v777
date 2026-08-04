@@ -33,6 +33,7 @@ class CameraModeActivity : AppCompatActivity() {
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private var analysisBusy = false
 
+    // Filtro anti-rumore: teniamo l'ultimo valore buono invece di seguire ogni lettura singola
     private var lastGoodSpeed: Double? = null
     private var pendingCandidate: Double? = null
     private var pendingCount = 0
@@ -124,6 +125,7 @@ class CameraModeActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    /** Converte il fotogramma YUV della fotocamera in un Bitmap normale, già ruotato correttamente. */
     private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
         val yBuffer = imageProxy.planes[0].buffer
         val uBuffer = imageProxy.planes[1].buffer
@@ -175,23 +177,21 @@ class CameraModeActivity : AppCompatActivity() {
             }
 
             val preprocessed = preprocessForOcr(bitmapToAnalyze)
-            val image = InputImage.fromBitmap(preprocessed, 0)
-            recognizer.process(image)
-                .addOnSuccessListener { visionText ->
-                    val digitsOnly = extractDigitsLeftToRight(visionText)
-                    val raw = parseDigitSpeed(digitsOnly)
-                    handleDetectedValue(raw)
-                }
-                .addOnCompleteListener {
-                    analysisBusy = false
-                    imageProxy.close()
-                }
+            val raw = readSevenSegmentSpeed(preprocessed)
+            handleDetectedValue(raw)
+            analysisBusy = false
+            imageProxy.close()
         } catch (e: Exception) {
             analysisBusy = false
             imageProxy.close()
         }
     }
 
+    /**
+     * Prepara l'immagine per l'OCR: la ingrandisce e la converte in bianco/nero netto
+     * (senza sfumature/rumore), tecnica standard per migliorare la lettura di display digitali
+     * a segmenti, che l'OCR "generico" fa fatica a leggere così come sono.
+     */
     private fun preprocessForOcr(source: Bitmap): Bitmap {
         val scaleFactor = 3
         val scaled = Bitmap.createScaledBitmap(source, source.width * scaleFactor, source.height * scaleFactor, true)
@@ -223,43 +223,120 @@ class CameraModeActivity : AppCompatActivity() {
         return result
     }
 
-    private fun extractDigitsLeftToRight(visionText: com.google.mlkit.vision.text.Text): String {
-        val pieces = mutableListOf<Pair<Int, String>>()
-        for (block in visionText.textBlocks) {
-            for (line in block.lines) {
-                for (element in line.elements) {
-                    val box = element.boundingBox ?: continue
-                    val digitsInElement = element.text.filter { it.isDigit() }
-                    if (digitsInElement.isNotEmpty()) {
-                        pieces.add(box.left to digitsInElement)
-                    }
-                }
+    /**
+     * Legge la velocità analizzando direttamente quali "barrette" del display sono accese,
+     * invece di affidarsi al riconoscimento OCR generico (che si è dimostrato inaffidabile
+     * su questo tipo di display a 7 segmenti).
+     */
+    private fun readSevenSegmentSpeed(binary: Bitmap): Double? {
+        val width = binary.width
+        val height = binary.height
+        val pixels = IntArray(width * height)
+        binary.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        val colDark = IntArray(width)
+        for (x in 0 until width) {
+            var count = 0
+            for (y in 0 until height) {
+                if (pixels[y * width + x] == android.graphics.Color.BLACK) count++
+            }
+            colDark[x] = count
+        }
+
+        val minDarkForColumn = (height * 0.05).toInt().coerceAtLeast(1)
+        val blobs = mutableListOf<IntRange>()
+        var blobStart = -1
+        for (x in 0 until width) {
+            val hasInk = colDark[x] >= minDarkForColumn
+            if (hasInk && blobStart == -1) {
+                blobStart = x
+            } else if (!hasInk && blobStart != -1) {
+                blobs.add(blobStart until x)
+                blobStart = -1
             }
         }
-        return pieces.sortedBy { it.first }.joinToString("") { it.second }
+        if (blobStart != -1) blobs.add(blobStart until width)
+
+        val minBlobWidth = (width * 0.03).toInt().coerceAtLeast(2)
+        val digitBlobs = blobs.filter { (it.last - it.first) >= minBlobWidth }
+        if (digitBlobs.isEmpty()) return null
+
+        val digits = digitBlobs.mapNotNull { range ->
+            decodeSevenSegmentDigit(pixels, width, height, range.first, range.last)
+        }
+        if (digits.isEmpty()) return null
+
+        // Formato fisso: l'ultima cifra letta è sempre il decimale
+        return when (digits.size) {
+            1 -> digits[0] / 10.0
+            2 -> digits[0] + digits[1] / 10.0
+            else -> {
+                val intPart = digits.dropLast(1).joinToString("") { it.toString() }.toIntOrNull() ?: return null
+                intPart + digits.last() / 10.0
+            }
+        }
     }
 
-    private fun parseDigitSpeed(digits: String): Double? {
-        return when (digits.length) {
-            0 -> null
-            1 -> digits.toIntOrNull()?.let { it / 10.0 }
-            2 -> {
-                val intPart = digits.substring(0, 1).toIntOrNull() ?: return null
-                val decDigit = digits.substring(1, 2).toIntOrNull() ?: 0
-                intPart + decDigit / 10.0
+    private fun decodeSevenSegmentDigit(pixels: IntArray, width: Int, height: Int, x0: Int, x1: Int): Int? {
+        var top = -1
+        var bottom = -1
+        for (y in 0 until height) {
+            var hasInk = false
+            for (x in x0..x1) {
+                if (pixels[y * width + x] == android.graphics.Color.BLACK) { hasInk = true; break }
             }
-            else -> {
-                val first3 = digits.take(3)
-                val intPart = first3.substring(0, 2).toIntOrNull() ?: return null
-                val decDigit = first3.substring(2, 3).toIntOrNull() ?: 0
-                intPart + decDigit / 10.0
+            if (hasInk) {
+                if (top == -1) top = y
+                bottom = y
             }
+        }
+        if (top == -1 || bottom - top < 4) return null
+
+        val h = (bottom - top).toFloat()
+        val w = (x1 - x0).toFloat()
+
+        fun zoneDark(fx0: Float, fx1: Float, fy0: Float, fy1: Float): Boolean {
+            val px0 = (x0 + fx0 * w).toInt().coerceIn(x0, x1)
+            val px1 = (x0 + fx1 * w).toInt().coerceIn(x0, x1)
+            val py0 = (top + fy0 * h).toInt().coerceIn(top, bottom)
+            val py1 = (top + fy1 * h).toInt().coerceIn(top, bottom)
+            var dark = 0
+            var total = 0
+            for (y in py0..py1) {
+                for (x in px0..px1) {
+                    total++
+                    if (pixels[y * width + x] == android.graphics.Color.BLACK) dark++
+                }
+            }
+            return total > 0 && dark.toFloat() / total > 0.35f
+        }
+
+        val segA = zoneDark(0.2f, 0.8f, 0.0f, 0.15f)
+        val segB = zoneDark(0.7f, 1.0f, 0.1f, 0.45f)
+        val segC = zoneDark(0.7f, 1.0f, 0.55f, 0.9f)
+        val segD = zoneDark(0.2f, 0.8f, 0.85f, 1.0f)
+        val segE = zoneDark(0.0f, 0.3f, 0.55f, 0.9f)
+        val segF = zoneDark(0.0f, 0.3f, 0.1f, 0.45f)
+        val segG = zoneDark(0.2f, 0.8f, 0.42f, 0.58f)
+
+        return when {
+            segA && segB && segC && segD && segE && segF && !segG -> 0
+            !segA && segB && segC && !segD && !segE && !segF && !segG -> 1
+            segA && segB && !segC && segD && segE && !segF && segG -> 2
+            segA && segB && segC && segD && !segE && !segF && segG -> 3
+            !segA && segB && segC && !segD && !segE && segF && segG -> 4
+            segA && !segB && segC && segD && !segE && segF && segG -> 5
+            segA && !segB && segC && segD && segE && segF && segG -> 6
+            segA && segB && segC && !segD && !segE && !segF && !segG -> 7
+            segA && segB && segC && segD && segE && segF && segG -> 8
+            segA && segB && segC && segD && !segE && segF && segG -> 9
+            else -> null
         }
     }
 
     private fun handleDetectedValue(raw: Double?) {
-        if (raw == null) return
-        if (raw !in 0.0..99.9) return
+        if (raw == null) return // nessuna cifra letta in questo fotogramma: teniamo l'ultimo valore buono
+        if (raw !in 0.0..99.9) return // fuori range plausibile, scartiamo
         acceptSpeed(raw)
     }
 
