@@ -282,14 +282,9 @@ class UsbCameraFragment : Fragment() {
             }
 
             val preprocessed = preprocessForOcr(bitmapToAnalyze)
-            val image = InputImage.fromBitmap(preprocessed, 0)
-            recognizer.process(image)
-                .addOnSuccessListener { visionText ->
-                    val digitsOnly = extractDigitsLeftToRight(visionText)
-                    val rawValue = parseDigitSpeed(digitsOnly)
-                    handleDetectedValue(rawValue)
-                }
-                .addOnCompleteListener { analysisBusy = false }
+            val rawValue = readSevenSegmentSpeed(preprocessed)
+            handleDetectedValue(rawValue)
+            analysisBusy = false
         } catch (e: Exception) {
             logLine("ECCEZIONE in handleFrame: ${e.javaClass.simpleName}: ${e.message}")
             analysisBusy = false
@@ -339,37 +334,108 @@ class UsbCameraFragment : Fragment() {
         return result
     }
 
-    private fun extractDigitsLeftToRight(visionText: com.google.mlkit.vision.text.Text): String {
-        val pieces = mutableListOf<Pair<Int, String>>()
-        for (block in visionText.textBlocks) {
-            for (line in block.lines) {
-                for (element in line.elements) {
-                    val box = element.boundingBox ?: continue
-                    val digitsInElement = element.text.filter { it.isDigit() }
-                    if (digitsInElement.isNotEmpty()) {
-                        pieces.add(box.left to digitsInElement)
-                    }
-                }
+    private fun readSevenSegmentSpeed(binary: Bitmap): Double? {
+        val width = binary.width
+        val height = binary.height
+        val pixels = IntArray(width * height)
+        binary.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        val colDark = IntArray(width)
+        for (x in 0 until width) {
+            var count = 0
+            for (y in 0 until height) {
+                if (pixels[y * width + x] == android.graphics.Color.BLACK) count++
+            }
+            colDark[x] = count
+        }
+
+        val minDarkForColumn = (height * 0.05).toInt().coerceAtLeast(1)
+        val blobs = mutableListOf<IntRange>()
+        var blobStart = -1
+        for (x in 0 until width) {
+            val hasInk = colDark[x] >= minDarkForColumn
+            if (hasInk && blobStart == -1) {
+                blobStart = x
+            } else if (!hasInk && blobStart != -1) {
+                blobs.add(blobStart until x)
+                blobStart = -1
             }
         }
-        return pieces.sortedBy { it.first }.joinToString("") { it.second }
+        if (blobStart != -1) blobs.add(blobStart until width)
+
+        val minBlobWidth = (width * 0.03).toInt().coerceAtLeast(2)
+        val digitBlobs = blobs.filter { (it.last - it.first) >= minBlobWidth }
+        if (digitBlobs.isEmpty()) return null
+
+        val digits = digitBlobs.mapNotNull { range ->
+            decodeSevenSegmentDigit(pixels, width, height, range.first, range.last)
+        }
+        if (digits.isEmpty()) return null
+
+        return when (digits.size) {
+            1 -> digits[0] / 10.0
+            2 -> digits[0] + digits[1] / 10.0
+            else -> {
+                val intPart = digits.dropLast(1).joinToString("") { it.toString() }.toIntOrNull() ?: return null
+                intPart + digits.last() / 10.0
+            }
+        }
     }
 
-    private fun parseDigitSpeed(digits: String): Double? {
-        return when (digits.length) {
-            0 -> null
-            1 -> digits.toIntOrNull()?.let { it / 10.0 }
-            2 -> {
-                val intPart = digits.substring(0, 1).toIntOrNull() ?: return null
-                val decDigit = digits.substring(1, 2).toIntOrNull() ?: 0
-                intPart + decDigit / 10.0
+    private fun decodeSevenSegmentDigit(pixels: IntArray, width: Int, height: Int, x0: Int, x1: Int): Int? {
+        var top = -1
+        var bottom = -1
+        for (y in 0 until height) {
+            var hasInk = false
+            for (x in x0..x1) {
+                if (pixels[y * width + x] == android.graphics.Color.BLACK) { hasInk = true; break }
             }
-            else -> {
-                val first3 = digits.take(3)
-                val intPart = first3.substring(0, 2).toIntOrNull() ?: return null
-                val decDigit = first3.substring(2, 3).toIntOrNull() ?: 0
-                intPart + decDigit / 10.0
+            if (hasInk) {
+                if (top == -1) top = y
+                bottom = y
             }
+        }
+        if (top == -1 || bottom - top < 4) return null
+
+        val h = (bottom - top).toFloat()
+        val w = (x1 - x0).toFloat()
+
+        fun zoneDark(fx0: Float, fx1: Float, fy0: Float, fy1: Float): Boolean {
+            val px0 = (x0 + fx0 * w).toInt().coerceIn(x0, x1)
+            val px1 = (x0 + fx1 * w).toInt().coerceIn(x0, x1)
+            val py0 = (top + fy0 * h).toInt().coerceIn(top, bottom)
+            val py1 = (top + fy1 * h).toInt().coerceIn(top, bottom)
+            var dark = 0
+            var total = 0
+            for (y in py0..py1) {
+                for (x in px0..px1) {
+                    total++
+                    if (pixels[y * width + x] == android.graphics.Color.BLACK) dark++
+                }
+            }
+            return total > 0 && dark.toFloat() / total > 0.35f
+        }
+
+        val segA = zoneDark(0.2f, 0.8f, 0.0f, 0.15f)
+        val segB = zoneDark(0.7f, 1.0f, 0.1f, 0.45f)
+        val segC = zoneDark(0.7f, 1.0f, 0.55f, 0.9f)
+        val segD = zoneDark(0.2f, 0.8f, 0.85f, 1.0f)
+        val segE = zoneDark(0.0f, 0.3f, 0.55f, 0.9f)
+        val segF = zoneDark(0.0f, 0.3f, 0.1f, 0.45f)
+        val segG = zoneDark(0.2f, 0.8f, 0.42f, 0.58f)
+
+        return when {
+            segA && segB && segC && segD && segE && segF && !segG -> 0
+            !segA && segB && segC && !segD && !segE && !segF && !segG -> 1
+            segA && segB && !segC && segD && segE && !segF && segG -> 2
+            segA && segB && segC && segD && !segE && !segF && segG -> 3
+            !segA && segB && segC && !segD && !segE && segF && segG -> 4
+            segA && !segB && segC && segD && !segE && segF && segG -> 5
+            segA && !segB && segC && segD && segE && segF && segG -> 6
+            segA && segB && segC && !segD && !segE && !segF && !segG -> 7
+            segA && segB && segC && segD && segE && segF && segG -> 8
+            segA && segB && segC && segD && !segE && segF && segG -> 9
+            else -> null
         }
     }
 
